@@ -1,0 +1,10 @@
+services:
+  tududi-gh-sync:
+    build: .
+    environment:
+      - GITHUB_TOKEN=your_github_pat_here
+      # Use host.docker.internal for Mac/Windows, or network_mode: host for Linux
+      - TUDUDI_URL=http://host.docker.internal:3002/api/v1
+      - TUDUDI_API_KEY=your_tududi_bearer_token
+      - SYNC_INTERVAL=300
+    restart: unless-stopped
