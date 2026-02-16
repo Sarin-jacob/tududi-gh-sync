@@ -300,11 +300,11 @@ func fetchTududiTasks() []Task {
 	}
 	var resp TaskResponse
 	
-	err := makeRequest("GET", "/tasks?type=all", nil, &resp)
+	err := makeRequest("GET", "/tasks?type=all&client_side_filtering=true", nil, &resp)
 	if err == nil && len(resp.Tasks) > 0 { return resp.Tasks }
 
 	var arrayResp []Task
-	if makeRequest("GET", "/tasks?type=all", nil, &arrayResp) == nil && len(arrayResp) > 0 {
+	if makeRequest("GET", "/tasks?type=all&client_side_filtering=true", nil, &arrayResp) == nil && len(arrayResp) > 0 {
 		return arrayResp
 	}
 
