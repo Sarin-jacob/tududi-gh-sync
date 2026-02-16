@@ -27,13 +27,11 @@ var (
 )
 
 // --- Data Structures ---
-
-// Project: Changed Status to interface{} to handle "0" (int) or "not_started" (string)
 type Project struct {
 	ID          int         `json:"id"`
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
-	Status      interface{} `json:"status"` 
+	Status      interface{} `json:"status"`
 	UID         string      `json:"uid,omitempty"`
 }
 
@@ -80,7 +78,6 @@ func main() {
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
-	// Initial Run
 	runSync(ctx, ghClient)
 
 	for range ticker.C {
@@ -101,7 +98,7 @@ func runSync(ctx context.Context, gh *github.Client) {
 	processedIDs := make(map[int64]bool)
 	var issuesToSync []*github.Issue
 
-	// 1. Fetch Issues (Assigned to me)
+	// 1. Fetch Issues
 	opts := &github.SearchOptions{Sort: "updated", Order: "desc"}
 	query := fmt.Sprintf("assignee:%s is:issue", myLogin)
 	
@@ -120,11 +117,8 @@ func runSync(ctx context.Context, gh *github.Client) {
 		}
 	}
 
-	// 2. Fetch Issues from Owned Repositories
-	repoOpts := &github.RepositoryListOptions{
-		Type: "owner", 
-		ListOptions: github.ListOptions{PerPage: 100},
-	}
+	// 2. Fetch Repos
+	repoOpts := &github.RepositoryListOptions{Type: "owner", ListOptions: github.ListOptions{PerPage: 100}}
 	repos, _, err := gh.Repositories.List(ctx, "", repoOpts)
 	if err != nil {
 		log.Printf("Error listing repos: %v", err)
@@ -132,9 +126,7 @@ func runSync(ctx context.Context, gh *github.Client) {
 		for _, repo := range repos {
 			if repo.GetOwner().GetLogin() == myLogin {
 				issueOpts := &github.IssueListByRepoOptions{
-					State: "all", 
-					Sort:  "updated",
-					Direction: "desc",
+					State: "all", Sort: "updated", Direction: "desc",
 					ListOptions: github.ListOptions{PerPage: 20},
 				}
 				repoIssues, _, err := gh.Issues.ListByRepo(ctx, myLogin, repo.GetName(), issueOpts)
@@ -158,7 +150,6 @@ func runSync(ctx context.Context, gh *github.Client) {
 }
 
 func syncIssuesToTududi(issues []*github.Issue) {
-	// --- FETCH DATA ---
 	existingTasks := fetchTududiTasks()
 	existingTaskMap := make(map[string]Task)
 	for _, t := range existingTasks {
@@ -168,22 +159,19 @@ func syncIssuesToTududi(issues []*github.Issue) {
 	}
 
 	projects := fetchTududiProjects()
-	projectMap := make(map[string]int) // Normalized Name -> ID
+	projectMap := make(map[string]int)
 
-	// Debug Log to verify we are actually seeing the projects
 	var projectNames []string
 	for _, p := range projects {
 		norm := normalizeName(p.Name)
 		projectMap[norm] = p.ID
-		projectNames = append(projectNames, fmt.Sprintf("%s(%d)", p.Name, p.ID))
+		projectNames = append(projectNames, fmt.Sprintf("%s", p.Name))
 	}
-	log.Printf("Loaded %d existing projects from Tududi: %v", len(projects), projectNames)
+	log.Printf("Loaded %d existing projects: %v", len(projects), projectNames)
 
-	// --- PROCESS ISSUES ---
 	for _, issue := range issues {
 		repo := issue.GetRepository()
 		
-		// Determine Repo Details
 		var repoID int64
 		var repoName, repoDesc string
 		var isArchived bool
@@ -191,7 +179,7 @@ func syncIssuesToTududi(issues []*github.Issue) {
 		if repo != nil {
 			repoID = repo.GetID()
 			repoName = repo.GetName()
-			repoDesc = repo.GetDescription() // Use actual description
+			repoDesc = repo.GetDescription()
 			isArchived = repo.GetArchived()
 		} else {
 			if issue.RepositoryURL != nil {
@@ -203,48 +191,39 @@ func syncIssuesToTududi(issues []*github.Issue) {
 		
 		tududiUID := fmt.Sprintf("gh_%d_%d", repoID, issue.GetNumber())
 		
-		// Map Status (String for now, API seems to accept strings in Swagger)
 		targetStatus := "pending"
 		if issue.GetState() == "closed" {
 			targetStatus = "completed"
 		}
 
-		// 1. UPDATE EXISTING TASK
+		// 1. UPDATE EXISTING
 		if task, exists := existingTaskMap[tududiUID]; exists {
-			// Check for status drift
-			// Simple check: if GH is closed but Tududi is pending, or GH is open but Tududi is completed
 			ghIsClosed := (targetStatus == "completed")
-			
-			// We handle status as interface{}, so convert to string for comparison
 			tududiStatus := fmt.Sprintf("%v", task.Status) 
 			tududiIsDone := (tududiStatus == "completed" || tududiStatus == "2" || tududiStatus == "archived")
 
 			if ghIsClosed && !tududiIsDone {
-				log.Printf("[UPDATE] Task '%s' marked completed in GitHub. Updating Tududi.", task.Name)
+				log.Printf("[UPDATE] Task '%s' marked completed in GitHub.", task.Name)
 				updateTaskStatus(task.ID, "completed")
 			} else if !ghIsClosed && tududiIsDone {
-				log.Printf("[UPDATE] Task '%s' re-opened in GitHub. Updating Tududi.", task.Name)
+				log.Printf("[UPDATE] Task '%s' re-opened in GitHub.", task.Name)
 				updateTaskStatus(task.ID, "pending")
 			}
 			continue
 		}
 
-		// 2. CREATE NEW TASK
-		
-		// Resolve Project
+		// 2. CREATE NEW
 		normRepoName := normalizeName(repoName)
 		projID, exists := projectMap[normRepoName]
 		
 		if !exists {
-			// Determine Project Status based on Repo Archive state
 			projectStatus := "planned"
 			if isArchived {
-				projectStatus = "done" // or "cancelled"
+				projectStatus = "done"
 			}
 
 			if dryRun {
-				log.Printf("[DRY RUN] Would create project: '%s' (Status: %s, Desc: %s)", repoName, projectStatus, repoDesc)
-				// In dry run, we can't get an ID, so we skip task creation for this repo
+				log.Printf("[DRY RUN] Would create project: '%s'", repoName)
 				continue
 			}
 
@@ -259,7 +238,6 @@ func syncIssuesToTududi(issues []*github.Issue) {
 			}
 		}
 
-		// Create Task
 		createTududiTask(issue, projID, tududiUID, repoName, targetStatus)
 	}
 }
@@ -280,17 +258,28 @@ func normalizeName(name string) string {
 	return strings.TrimSpace(name)
 }
 
+// FIXED: Now correctly handles { "projects": [...] } response wrapper
 func fetchTududiProjects() []Project {
-	var projects []Project
-	// Explicitly ask for ALL statuses
-	err := makeRequest("GET", "/projects?status=all", nil, &projects)
-	
-	if err != nil {
-		// If direct decode failed, it might be wrapped or the status type caused an unmarshal error earlier.
-		// Since we changed Status to interface{}, unmarshal should be safer now.
-		log.Printf("Error fetching projects: %v", err)
+	type ProjectResponse struct {
+		Projects []Project `json:"projects"`
 	}
-	return projects
+	var resp ProjectResponse
+	
+	// Try parsing as Object wrapper first (Most likely correct based on logs)
+	err := makeRequest("GET", "/projects?status=all", nil, &resp)
+	if err == nil && len(resp.Projects) > 0 {
+		return resp.Projects
+	}
+
+	// Fallback: Try parsing as Array directly (Legacy/Alternate support)
+	var projects []Project
+	if makeRequest("GET", "/projects?status=all", nil, &projects) == nil {
+		return projects
+	}
+	
+	// If both fail, log the error from the wrapper attempt as it's the primary target
+	log.Printf("Warning: Failed to fetch projects (Check API response format): %v", err)
+	return []Project{}
 }
 
 func fetchTududiTasks() []Task {
@@ -411,8 +400,6 @@ func makeRequest(method, endpoint string, body interface{}, target interface{}) 
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		// Only suppress 404s if strictly expecting them (logic handled in caller)
-		// But generally printing is safer for debug
 		log.Printf("API Error (%d) on %s: %s", resp.StatusCode, endpoint, string(b))
 		return fmt.Errorf("API Error %d", resp.StatusCode)
 	}
