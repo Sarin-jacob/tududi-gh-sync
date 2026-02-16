@@ -169,6 +169,9 @@ func syncIssuesToTududi(issues []*github.Issue) {
 	}
 	log.Printf("Loaded %d existing projects: %v", len(projects), projectNames)
 
+	// Dry Run Mock ID Counter (starts negative to avoid collision with real IDs)
+	mockProjectIDCounter := -1
+
 	for _, issue := range issues {
 		repo := issue.GetRepository()
 		
@@ -223,18 +226,21 @@ func syncIssuesToTududi(issues []*github.Issue) {
 			}
 
 			if dryRun {
-				log.Printf("[DRY RUN] Would create project: '%s'", repoName)
-				continue
-			}
-
-			log.Printf("Project '%s' not found. Creating...", repoName)
-			newID := createTududiProject(repoName, repoDesc, projectStatus)
-			if newID != 0 {
-				projectMap[normRepoName] = newID
-				projID = newID
+				// Assign a mock ID so subsequent issues for this repo don't trigger "Would create" again
+				log.Printf("[DRY RUN] Would create project: '%s' (Status: %s)", repoName, projectStatus)
+				projectMap[normRepoName] = mockProjectIDCounter
+				projID = mockProjectIDCounter
+				mockProjectIDCounter--
 			} else {
-				log.Printf("Skipping issue %d (Project creation failed)", issue.GetNumber())
-				continue
+				log.Printf("Project '%s' not found. Creating...", repoName)
+				newID := createTududiProject(repoName, repoDesc, projectStatus)
+				if newID != 0 {
+					projectMap[normRepoName] = newID
+					projID = newID
+				} else {
+					log.Printf("Skipping issue %d (Project creation failed)", issue.GetNumber())
+					continue
+				}
 			}
 		}
 
@@ -258,26 +264,22 @@ func normalizeName(name string) string {
 	return strings.TrimSpace(name)
 }
 
-// FIXED: Now correctly handles { "projects": [...] } response wrapper
 func fetchTududiProjects() []Project {
 	type ProjectResponse struct {
 		Projects []Project `json:"projects"`
 	}
 	var resp ProjectResponse
 	
-	// Try parsing as Object wrapper first (Most likely correct based on logs)
 	err := makeRequest("GET", "/projects?status=all", nil, &resp)
 	if err == nil && len(resp.Projects) > 0 {
 		return resp.Projects
 	}
 
-	// Fallback: Try parsing as Array directly (Legacy/Alternate support)
 	var projects []Project
 	if makeRequest("GET", "/projects?status=all", nil, &projects) == nil {
 		return projects
 	}
 	
-	// If both fail, log the error from the wrapper attempt as it's the primary target
 	log.Printf("Warning: Failed to fetch projects (Check API response format): %v", err)
 	return []Project{}
 }
@@ -320,8 +322,9 @@ func createTududiProject(name, description, status string) int {
 }
 
 func createTududiTask(issue *github.Issue, projectID int, uid string, repoName string, status string) {
+	// If Dry Run, explicitly Log the Status we WOULD create
 	if dryRun {
-		log.Printf("[DRY RUN] Would create Task: '%s' in ProjectID %d", issue.GetTitle(), projectID)
+		log.Printf("[DRY RUN] Would create Task: '%s' [%s] in ProjectID %d", issue.GetTitle(), status, projectID)
 		return
 	}
 
@@ -400,7 +403,9 @@ func makeRequest(method, endpoint string, body interface{}, target interface{}) 
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		log.Printf("API Error (%d) on %s: %s", resp.StatusCode, endpoint, string(b))
+		if resp.StatusCode != 404 || method != "GET" {
+			log.Printf("API Error (%d) on %s: %s", resp.StatusCode, endpoint, string(b))
+		}
 		return fmt.Errorf("API Error %d", resp.StatusCode)
 	}
 
