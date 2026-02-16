@@ -24,9 +24,9 @@ var (
 	tududiAPIKey = os.Getenv("TUDUDI_API_KEY")
 	syncInterval = os.Getenv("SYNC_INTERVAL")
 	dryRun       = os.Getenv("DRY_RUN") == "true"
+	debugMode    = os.Getenv("DEBUG") == "true" // NEW: Enable verbose logs
 )
 
-// --- Constants ---
 const (
 	StatusNotStarted = 0
 	StatusInProgress = 1
@@ -35,9 +35,9 @@ const (
 
 // --- Data Structures ---
 type Project struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	ID          int         `json:"id"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
 	Status      interface{} `json:"status"`
 }
 
@@ -46,14 +46,11 @@ type Tag struct {
 }
 
 type Task struct {
-	ID        int    `json:"id,omitempty"`
+	ID        int    `json:"id"` // Ensure this parses correctly
 	Name      string `json:"name"`
-	Note      string `json:"note"`
-	Status    int    `json:"status"` // Changed to int
-	Priority  string `json:"priority"`
+	Status    int    `json:"status"`
 	ProjectID int    `json:"project_id"`
-	DueDate   string `json:"due_date,omitempty"`
-	Tags      []Tag  `json:"tags,omitempty"`
+	UID       string `json:"uid,omitempty"`
 }
 
 func main() {
@@ -70,7 +67,10 @@ func main() {
 	}
 
 	if dryRun {
-		log.Println("⚠️  DRY RUN MODE ENABLED: No changes will be made to Tududi ⚠️")
+		log.Println("⚠️  DRY RUN MODE ENABLED ⚠️")
+	}
+	if debugMode {
+		log.Println("🐛 DEBUG MODE ENABLED 🐛")
 	}
 
 	ctx := context.Background()
@@ -157,27 +157,24 @@ func runSync(ctx context.Context, gh *github.Client) {
 func syncIssuesToTududi(issues []*github.Issue) {
 	// --- FETCH DATA ---
 	
-	// 1. Projects
 	projects := fetchTududiProjects()
-	projectMap := make(map[string]int) // Name -> ID
+	projectMap := make(map[string]int)
 	for _, p := range projects {
 		projectMap[normalizeName(p.Name)] = p.ID
 	}
-	log.Printf("Loaded %d existing projects", len(projects))
+	log.Printf("Loaded %d existing PROJECTS", len(projects))
 
-	// 2. Tasks
-	// We build a map of "ProjectID + TaskName" -> Task to detect duplicates
-	// Since Tududi likely ignores our custom UID, we must rely on Name + Project
+	// Fetch Tasks and build deduplication map
 	existingTasks := fetchTududiTasks()
 	taskDedupMap := make(map[string]Task)
 
 	for _, t := range existingTasks {
-		// Key: "ProjectID|TaskName" (normalized)
+		// Key: "ProjectID|TaskName"
 		key := fmt.Sprintf("%d|%s", t.ProjectID, normalizeName(t.Name))
 		taskDedupMap[key] = t
 	}
+	log.Printf("Loaded %d existing TASKS for deduplication", len(existingTasks))
 
-	// Mock ID for dry run new projects
 	mockProjectIDCounter := -1
 
 	// --- PROCESS ISSUES ---
@@ -199,13 +196,12 @@ func syncIssuesToTududi(issues []*github.Issue) {
 			repoDesc = fmt.Sprintf("Imported GitHub Repository: %s", repoName)
 		}
 
-		// Determine Status (Integer)
 		targetStatus := StatusNotStarted
 		if issue.GetState() == "closed" {
 			targetStatus = StatusCompleted
 		}
 
-		// --- RESOLVE PROJECT ---
+		// Resolve Project
 		normRepoName := normalizeName(repoName)
 		projID, exists := projectMap[normRepoName]
 		
@@ -227,42 +223,40 @@ func syncIssuesToTududi(issues []*github.Issue) {
 					projectMap[normRepoName] = newID
 					projID = newID
 				} else {
-					log.Printf("Skipping issue %d (Project creation failed)", issue.GetNumber())
 					continue
 				}
 			}
 		}
 
-		// --- DEDUPLICATION CHECK ---
-		// Key: "ProjectID|TaskName"
+		// Deduplication Check
 		dedupKey := fmt.Sprintf("%d|%s", projID, normalizeName(issue.GetTitle()))
 		
 		if task, found := taskDedupMap[dedupKey]; found {
-			// Task Exists - Check Status Drift
-			if task.Status != targetStatus {
-				// Only update if statuses actually differ
-				// Note: User defines: 0=not_started, 1=in_progress, 2=completed
-				
-				// If GH is closed (2), but local is pending (0) or progress (1) -> Update to 2
-				// If GH is open (0), but local is completed (2) -> Reopen to 0
-				
-				shouldUpdate := false
-				if targetStatus == StatusCompleted && task.Status != StatusCompleted {
-					shouldUpdate = true
-				} else if targetStatus == StatusNotStarted && task.Status == StatusCompleted {
-					shouldUpdate = true
-				}
-
-				if shouldUpdate {
-					log.Printf("[UPDATE] Task '%s' status change: %d -> %d", task.Name, task.Status, targetStatus)
-					updateTaskStatus(task.ID, targetStatus)
-				}
+			// Found existing task - check status
+			if debugMode {
+				log.Printf("Dedup match: '%s' (ID: %d, Status: %d, Target: %d)", task.Name, task.ID, task.Status, targetStatus)
 			}
-			continue // Task already exists, move to next
+			
+			// If GitHub is Closed (2) and Task is Not Completed (0 or 1)
+			if targetStatus == StatusCompleted && task.Status != StatusCompleted {
+				log.Printf("[UPDATE] Task '%s' marked completed in GitHub.", task.Name)
+				updateTaskStatus(task.ID, StatusCompleted)
+			} else if targetStatus == StatusNotStarted && task.Status == StatusCompleted {
+				log.Printf("[UPDATE] Task '%s' re-opened in GitHub.", task.Name)
+				updateTaskStatus(task.ID, StatusNotStarted)
+			}
+			continue
+		} else {
+			if debugMode {
+				log.Printf("No dedup match for key: [%s]", dedupKey)
+			}
 		}
 
-		// --- CREATE NEW TASK ---
+		// Create New
 		createTududiTask(issue, projID, repoName, targetStatus)
+		
+		// Add to local map to prevent duplication within the same run cycle
+		taskDedupMap[dedupKey] = Task{Name: issue.GetTitle(), ProjectID: projID, Status: targetStatus}
 	}
 }
 
@@ -296,45 +290,44 @@ func fetchTududiProjects() []Project {
 }
 
 func fetchTududiTasks() []Task {
+	// Try fetching ALL tasks
+	// We handle both Array and Object return types
 	type TaskResponse struct {
 		Tasks []Task `json:"tasks"`
 	}
 	var resp TaskResponse
 	
-	// Ensure we fetch ALL tasks to perform accurate deduplication
+	// 1. Try ?type=all
 	err := makeRequest("GET", "/tasks?type=all", nil, &resp)
-	if err == nil { return resp.Tasks }
+	if err == nil && len(resp.Tasks) > 0 { return resp.Tasks }
 
+	// 2. Fallback: Array response
 	var arrayResp []Task
-	makeRequest("GET", "/tasks?type=all", nil, &arrayResp)
-	return arrayResp
+	if makeRequest("GET", "/tasks?type=all", nil, &arrayResp) == nil && len(arrayResp) > 0 {
+		return arrayResp
+	}
+
+	// 3. Last Resort: Try without filters (some APIs default to all if no filter)
+	if makeRequest("GET", "/tasks", nil, &resp) == nil { return resp.Tasks }
+
+	return []Task{}
 }
 
 func createTududiProject(name, description, status string) int {
-	if description == "" {
-		description = fmt.Sprintf("Imported GitHub Repository: %s", name)
-	}
-	// Tududi might accept int or string for status on creation. 
-	// If it fails with string, user might need to map "planned" -> int.
-	// For now, keeping string as per previous logs saying projects were created fine.
+	if description == "" { description = fmt.Sprintf("Imported GitHub Repository: %s", name) }
+	
 	payload := map[string]interface{}{
-		"name":        name,
-		"status":      status, 
-		"description": description,
-		"priority":    "medium",
+		"name": name, "status": status, "description": description, "priority": "medium",
 	}
 	var result Project
 	err := makeRequest("POST", "/project", payload, &result)
-	if err != nil {
-		log.Printf("Failed to create project: %v", err)
-		return 0
-	}
+	if err != nil { return 0 }
 	return result.ID
 }
 
 func createTududiTask(issue *github.Issue, projectID int, repoName string, status int) {
 	if dryRun {
-		log.Printf("[DRY RUN] Would create Task: '%s' [Status: %d] in ProjectID %d", issue.GetTitle(), status, projectID)
+		log.Printf("[DRY RUN] Would create Task: '%s' [Status: %d]", issue.GetTitle(), status)
 		return
 	}
 
@@ -349,27 +342,25 @@ func createTududiTask(issue *github.Issue, projectID int, repoName string, statu
 		}
 	}
 	
-	tags := []Tag{
-		{Name: repoName},
-		{Name: "github"},
-	}
+	tags := []Tag{{Name: repoName}, {Name: "github"}}
 
-	task := Task{
-		Name:      issue.GetTitle(),
-		Note:      note,
-		Status:    status, // Sending INT here (0, 1, 2)
-		Priority:  priority,
-		ProjectID: projectID,
-		Tags:      tags,
+	task := map[string]interface{}{
+		"name": issue.GetTitle(),
+		"note": note,
+		"status": status, // Sending INT
+		"priority": priority,
+		"project_id": projectID,
+		"tags": tags,
 	}
 
 	if issue.Milestone != nil && issue.Milestone.DueOn != nil {
-		task.DueDate = issue.Milestone.DueOn.Format(time.RFC3339)
+		task["due_date"] = issue.Milestone.DueOn.Format(time.RFC3339)
 	}
 
+	// Make request but ignore return body, we just check error
 	err := makeRequest("POST", "/task", task, nil)
 	if err == nil {
-		log.Printf("Created Task: %s [Status: %d]", task.Name, status)
+		log.Printf("Created Task: %s [Status: %d]", issue.GetTitle(), status)
 	}
 }
 
@@ -378,11 +369,7 @@ func updateTaskStatus(taskID int, status int) {
 		log.Printf("[DRY RUN] Would update Task %d status to %d", taskID, status)
 		return
 	}
-
-	// Payload uses INT for status
-	payload := map[string]int{
-		"status": status,
-	}
+	payload := map[string]int{"status": status}
 	endpoint := fmt.Sprintf("/task/%d", taskID)
 	makeRequest("PATCH", endpoint, payload, nil)
 }
@@ -390,32 +377,38 @@ func updateTaskStatus(taskID int, status int) {
 func makeRequest(method, endpoint string, body interface{}, target interface{}) error {
 	client := &http.Client{Timeout: 10 * time.Second}
 	var bodyReader io.Reader
-
 	if body != nil {
 		jsonBytes, _ := json.Marshal(body)
 		bodyReader = bytes.NewBuffer(jsonBytes)
 	}
-
 	req, err := http.NewRequest(method, tududiURL+endpoint, bodyReader)
 	if err != nil { return err }
-
-	for k, v := range getHeaders() {
-		req.Header.Set(k, v)
-	}
+	for k, v := range getHeaders() { req.Header.Set(k, v) }
 
 	resp, err := client.Do(req)
 	if err != nil { return err }
 	defer resp.Body.Close()
 
+	if debugMode {
+		log.Printf("[DEBUG] %s %s -> %d", method, endpoint, resp.StatusCode)
+	}
+
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
+		if debugMode { log.Printf("[DEBUG] Error Body: %s", string(b)) }
 		if resp.StatusCode != 404 || method != "GET" {
-			log.Printf("API Error (%d) on %s: %s", resp.StatusCode, endpoint, string(b))
+			log.Printf("API Error (%d) on %s", resp.StatusCode, endpoint)
 		}
 		return fmt.Errorf("API Error %d", resp.StatusCode)
 	}
 
 	if target != nil {
+		// Dump body to debug if needed, otherwise strict decode
+		if debugMode {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			// log.Printf("[DEBUG] Response: %s", string(bodyBytes))
+			return json.Unmarshal(bodyBytes, target)
+		}
 		return json.NewDecoder(resp.Body).Decode(target)
 	}
 	return nil
