@@ -17,19 +17,20 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Configuration
+// --- Configuration ---
 var (
-	githubToken   = os.Getenv("GITHUB_TOKEN")
-	tududiURL     = strings.TrimRight(os.Getenv("TUDUDI_URL"), "/")
-	tududiAPIKey  = os.Getenv("TUDUDI_API_KEY")
-	syncInterval  = os.Getenv("SYNC_INTERVAL")
+	githubToken  = os.Getenv("GITHUB_TOKEN")
+	tududiURL    = strings.TrimRight(os.Getenv("TUDUDI_URL"), "/")
+	tududiAPIKey = os.Getenv("TUDUDI_API_KEY")
+	syncInterval = os.Getenv("SYNC_INTERVAL")
 )
 
-// Data Structures
+// --- Data Structures ---
 type Project struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
-	UID  string `json:"uid,omitempty"`
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	UID         string `json:"uid,omitempty"`
 }
 
 type Tag struct {
@@ -37,10 +38,11 @@ type Tag struct {
 }
 
 type Task struct {
-	UID       string `json:"uid,omitempty"` // API might ignore this on creation, but we send it for intent
+	ID        int    `json:"id,omitempty"` // ID is needed for updates
+	UID       string `json:"uid,omitempty"`
 	Name      string `json:"name"`
 	Note      string `json:"note"`
-	Status    string `json:"status"`
+	Status    string `json:"status"` // pending, completed, archived
 	Priority  string `json:"priority"`
 	ProjectID int    `json:"project_id"`
 	DueDate   string `json:"due_date,omitempty"`
@@ -48,7 +50,6 @@ type Task struct {
 }
 
 func main() {
-	// 1. Basic Setup
 	if githubToken == "" || tududiAPIKey == "" {
 		log.Fatal("Missing GITHUB_TOKEN or TUDUDI_API_KEY environment variables.")
 	}
@@ -58,7 +59,7 @@ func main() {
 
 	interval, err := strconv.Atoi(syncInterval)
 	if err != nil || interval < 10 {
-		interval = 300 // Default to 5 minutes
+		interval = 300
 	}
 
 	ctx := context.Background()
@@ -68,11 +69,10 @@ func main() {
 
 	log.Printf("Starting Sync Service. Interval: %d seconds", interval)
 
-	// 2. Scheduler Loop
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
-	// Run once immediately
+	// Initial Run
 	runSync(ctx, ghClient)
 
 	for range ticker.C {
@@ -90,32 +90,33 @@ func runSync(ctx context.Context, gh *github.Client) {
 	}
 	myLogin := user.GetLogin()
 
-	// Track IDs to prevent processing the same issue twice in one run
 	processedIDs := make(map[int64]bool)
 	var issuesToSync []*github.Issue
 
-	// ---------------------------------------------------------
-	// 3. GitHub Fetching Logic
-	// ---------------------------------------------------------
+	// 1. Fetch Issues (Removed 'state:open' so we get closed ones too)
+	// We sort by updated to ensure we catch status changes
+	opts := &github.SearchOptions{Sort: "updated", Order: "desc"}
 	
-	// A. Search Assigned Issues
-	// Added 'is:issue' to fix the 422 error
-	opts := &github.SearchOptions{Sort: "created", Order: "desc"}
-	query := fmt.Sprintf("assignee:%s is:issue state:open", myLogin)
+	// Query: Assigned to me AND is an Issue (not PR)
+	query := fmt.Sprintf("assignee:%s is:issue", myLogin)
 	
 	result, _, err := gh.Search.Issues(ctx, query, opts)
 	if err != nil {
-		log.Printf("Error searching assigned issues: %v", err)
+		log.Printf("Error searching issues: %v", err)
 	} else {
+		// Limit to first 50 updated issues to save API quota on repeated runs
+		count := 0
 		for _, issue := range result.Issues {
+			if count >= 50 { break }
 			if !processedIDs[issue.GetID()] {
 				issuesToSync = append(issuesToSync, issue)
 				processedIDs[issue.GetID()] = true
+				count++
 			}
 		}
 	}
 
-	// B. Iterate Owned Repositories
+	// 2. Fetch Owned Repositories (Also fetching closed issues to sync state)
 	repoOpts := &github.RepositoryListOptions{
 		Type: "owner", 
 		ListOptions: github.ListOptions{PerPage: 100},
@@ -126,9 +127,12 @@ func runSync(ctx context.Context, gh *github.Client) {
 	} else {
 		for _, repo := range repos {
 			if repo.GetOwner().GetLogin() == myLogin {
+				// Fetch recent issues (open and closed)
 				issueOpts := &github.IssueListByRepoOptions{
-					State: "open", 
-					ListOptions: github.ListOptions{PerPage: 50},
+					State: "all", // Fetch open and closed
+					Sort:  "updated",
+					Direction: "desc",
+					ListOptions: github.ListOptions{PerPage: 20}, // Get last 20 updated per repo
 				}
 				repoIssues, _, err := gh.Issues.ListByRepo(ctx, myLogin, repo.GetName(), issueOpts)
 				if err != nil {
@@ -146,79 +150,98 @@ func runSync(ctx context.Context, gh *github.Client) {
 		}
 	}
 
-	if len(issuesToSync) == 0 {
-		log.Println("No issues found to sync.")
-		return
-	}
-
-	log.Printf("Found %d unique issues to process.", len(issuesToSync))
+	log.Printf("Processing %d issues...", len(issuesToSync))
 	syncIssuesToTududi(issuesToSync)
 }
 
 func syncIssuesToTududi(issues []*github.Issue) {
-	// ---------------------------------------------------------
-	// 4. Tududi Deduplication & Creation
-	// ---------------------------------------------------------
-	
-	// Fetch existing data to avoid duplicates
+	// Map Existing Tasks: UID -> Task Object
 	existingTasks := fetchTududiTasks()
-	existingUIDs := make(map[string]bool)
+	existingTaskMap := make(map[string]Task)
 	
-	// We map UIDs to check if "gh_xxx" already exists
 	for _, t := range existingTasks {
 		if t.UID != "" {
-			existingUIDs[t.UID] = true
+			existingTaskMap[t.UID] = t
 		}
 	}
 
+	// Map Projects: Normalized Name -> ID
 	projects := fetchTududiProjects()
-	projectMap := make(map[string]int) // Key: Normalized Name, Value: ID
+	projectMap := make(map[string]int)
 
 	for _, p := range projects {
 		projectMap[normalizeName(p.Name)] = p.ID
 	}
 
 	for _, issue := range issues {
-		// Determine Repo Name and ID
 		repo := issue.GetRepository()
-		repoID := int64(0)
-		repoName := "Unknown Repository"
+		
+		// Determine Repo Name and Details
+		var repoID int64
+		var repoName, repoDesc string
 		
 		if repo != nil {
 			repoID = repo.GetID()
 			repoName = repo.GetName()
-		} else if issue.RepositoryURL != nil {
-			// Fallback parsing if Repository struct is empty (common in Search results)
-			parts := strings.Split(*issue.RepositoryURL, "/")
-			repoName = parts[len(parts)-1]
-			// We can't easily get ID from URL, so we rely on issue ID for uniqueness if repo ID missing
+			repoDesc = repo.GetDescription()
+		} else {
+			// Fallback parsing
+			if issue.RepositoryURL != nil {
+				parts := strings.Split(*issue.RepositoryURL, "/")
+				repoName = parts[len(parts)-1]
+			}
+			repoDesc = fmt.Sprintf("Imported GitHub Repository: %s", repoName)
 		}
 		
-		// Generate Unique ID: gh_{repoID}_{issueNumber}
 		tududiUID := fmt.Sprintf("gh_%d_%d", repoID, issue.GetNumber())
-
-		// SKIP if already exists
-		if existingUIDs[tududiUID] {
-			continue
+		
+		// Determine target statuses
+		targetStatus := "pending"
+		if issue.GetState() == "closed" {
+			targetStatus = "completed"
 		}
 
-		// Check or Create Project
+		// --- CHECK 1: Does Task Exist? ---
+		if task, exists := existingTaskMap[tududiUID]; exists {
+			// Task exists. Check if we need to update status.
+			// Tududi Statuses: pending, completed, archived
+			// GitHub Statuses: open, closed
+			
+			needsUpdate := false
+			
+			if targetStatus == "completed" && task.Status == "pending" {
+				needsUpdate = true
+			} else if targetStatus == "pending" && (task.Status == "completed" || task.Status == "archived") {
+				needsUpdate = true
+			}
+
+			if needsUpdate {
+				log.Printf("Updating Status for '%s': %s -> %s", task.Name, task.Status, targetStatus)
+				updateTaskStatus(task.ID, targetStatus)
+			}
+			continue // Skip to next issue
+		}
+
+		// --- CHECK 2: Create New Task ---
+		
+		// Find Project ID
 		normRepoName := normalizeName(repoName)
 		projID, exists := projectMap[normRepoName]
 		
 		if !exists {
-			log.Printf("Creating new project for repo: %s", repoName)
-			newID := createTududiProject(repoName)
+			log.Printf("Project '%s' not found locally. Creating...", repoName)
+			newID := createTududiProject(repoName, repoDesc)
 			if newID != 0 {
 				projectMap[normRepoName] = newID
 				projID = newID
 			} else {
-				log.Printf("Skipping task creation for issue %d (Project creation failed)", issue.GetNumber())
+				log.Printf("Skipping issue %d (Project creation failed)", issue.GetNumber())
 				continue
 			}
 		}
 
-		createTududiTask(issue, projID, tududiUID, repoName)
+		// Create the task
+		createTududiTask(issue, projID, tududiUID, repoName, targetStatus)
 	}
 }
 
@@ -240,41 +263,48 @@ func normalizeName(name string) string {
 
 func fetchTududiProjects() []Project {
 	var projects []Project
-	// GET /api/projects (Plural is correct for fetching)
-	makeRequest("GET", "/projects", nil, &projects)
+	// ADDED: ?status=all
+	// Without this, Tududi might hide 'done' or 'planned' projects, causing duplicates.
+	err := makeRequest("GET", "/projects?status=all", nil, &projects)
+	if err != nil {
+		log.Printf("Warning: Failed to fetch projects: %v", err)
+	}
 	return projects
 }
 
 func fetchTududiTasks() []Task {
-	// GET /api/tasks returns { "tasks": [...] } structure based on Swagger
-	// We need a wrapper struct to decode it correctly
+	// Added filtering to get ALL tasks, including completed ones, so we don't recreate them
 	type TaskResponse struct {
 		Tasks []Task `json:"tasks"`
 	}
 	var resp TaskResponse
 	
-	// If the API returns a direct array, this might fail, but Swagger says it returns an object
-	err := makeRequest("GET", "/tasks", nil, &resp)
+	// Fetch 'all' types (pending, completed, archived)
+	err := makeRequest("GET", "/tasks?type=all", nil, &resp)
 	if err != nil {
-		// Fallback: try decoding as array just in case swagger is slightly off
+		// Fallback for different API structures
 		var arrayResp []Task
-		if makeRequest("GET", "/tasks", nil, &arrayResp) == nil {
+		if makeRequest("GET", "/tasks?type=all", nil, &arrayResp) == nil {
 			return arrayResp
 		}
 	}
 	return resp.Tasks
 }
 
-func createTududiProject(name string) int {
-	payload := map[string]string{
+func createTududiProject(name, description string) int {
+	if description == "" {
+		description = "Imported from GitHub"
+	}
+	
+	payload := map[string]interface{}{
 		"name":        name,
 		"status":      "planned",
-		"description": "Imported from GitHub",
+		"description": description,
 		"priority":    "medium",
+		// "image_url": "...", // If you had a URL, you could add it here
 	}
 	var result Project
 	
-	// FIX: POST /api/project (Singular)
 	err := makeRequest("POST", "/project", payload, &result)
 	if err != nil {
 		return 0
@@ -282,7 +312,7 @@ func createTududiProject(name string) int {
 	return result.ID
 }
 
-func createTududiTask(issue *github.Issue, projectID int, uid string, repoName string) {
+func createTududiTask(issue *github.Issue, projectID int, uid string, repoName string, status string) {
 	note := issue.GetBody()
 	note += fmt.Sprintf("\n\n**GitHub Source**: [Issue #%d](%s)", issue.GetNumber(), issue.GetHTMLURL())
 
@@ -294,17 +324,16 @@ func createTududiTask(issue *github.Issue, projectID int, uid string, repoName s
 		}
 	}
 	
-	// Prepare Tags
 	tags := []Tag{
 		{Name: repoName},
 		{Name: "github"},
 	}
 
 	task := Task{
-		UID:       uid, // Trying to send UID. If API ignores it, deduplication relies on persistence
+		UID:       uid,
 		Name:      issue.GetTitle(),
 		Note:      note,
-		Status:    "pending",
+		Status:    status, // Set initial status based on GH state
 		Priority:  priority,
 		ProjectID: projectID,
 		Tags:      tags,
@@ -314,10 +343,23 @@ func createTududiTask(issue *github.Issue, projectID int, uid string, repoName s
 		task.DueDate = issue.Milestone.DueOn.Format(time.RFC3339)
 	}
 
-	// FIX: POST /api/task (Singular)
 	err := makeRequest("POST", "/task", task, nil)
 	if err == nil {
-		log.Printf("Created Task: %s (Project ID: %d)", task.Name, projectID)
+		log.Printf("Created Task: %s [%s]", task.Name, status)
+	}
+}
+
+func updateTaskStatus(taskID int, status string) {
+	// Using the specific toggle endpoint isn't ideal for setting exact state,
+	// so we use the PATCH endpoint to force specific fields.
+	payload := map[string]string{
+		"status": status,
+	}
+	
+	endpoint := fmt.Sprintf("/task/%d", taskID)
+	err := makeRequest("PATCH", endpoint, payload, nil)
+	if err != nil {
+		log.Printf("Failed to update task %d: %v", taskID, err)
 	}
 }
 
@@ -348,9 +390,11 @@ func makeRequest(method, endpoint string, body interface{}, target interface{}) 
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		// Don't log full error for 404/duplicates if we expect them, but here we log everything for debug
-		log.Printf("API Error (%d) on %s: %s", resp.StatusCode, endpoint, string(b))
-		return fmt.Errorf("API Error")
+		// Only log 404s if we are not expecting them (like checking for existence)
+		if resp.StatusCode != 404 || method != "GET" {
+			log.Printf("API Error (%d) on %s: %s", resp.StatusCode, endpoint, string(b))
+		}
+		return fmt.Errorf("API Error %d", resp.StatusCode)
 	}
 
 	if target != nil {
