@@ -23,14 +23,18 @@ var (
 	tududiURL    = strings.TrimRight(os.Getenv("TUDUDI_URL"), "/")
 	tududiAPIKey = os.Getenv("TUDUDI_API_KEY")
 	syncInterval = os.Getenv("SYNC_INTERVAL")
+	dryRun       = os.Getenv("DRY_RUN") == "true"
 )
 
 // --- Data Structures ---
+
+// Project: Changed Status to interface{} to handle "0" (int) or "not_started" (string)
 type Project struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	UID         string `json:"uid,omitempty"`
+	ID          int         `json:"id"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Status      interface{} `json:"status"` 
+	UID         string      `json:"uid,omitempty"`
 }
 
 type Tag struct {
@@ -38,15 +42,15 @@ type Tag struct {
 }
 
 type Task struct {
-	ID        int    `json:"id,omitempty"` // ID is needed for updates
-	UID       string `json:"uid,omitempty"`
-	Name      string `json:"name"`
-	Note      string `json:"note"`
-	Status    string `json:"status"` // pending, completed, archived
-	Priority  string `json:"priority"`
-	ProjectID int    `json:"project_id"`
-	DueDate   string `json:"due_date,omitempty"`
-	Tags      []Tag  `json:"tags,omitempty"`
+	ID        int         `json:"id,omitempty"`
+	UID       string      `json:"uid,omitempty"`
+	Name      string      `json:"name"`
+	Note      string      `json:"note"`
+	Status    interface{} `json:"status"`
+	Priority  string      `json:"priority"`
+	ProjectID int         `json:"project_id"`
+	DueDate   string      `json:"due_date,omitempty"`
+	Tags      []Tag       `json:"tags,omitempty"`
 }
 
 func main() {
@@ -60,6 +64,10 @@ func main() {
 	interval, err := strconv.Atoi(syncInterval)
 	if err != nil || interval < 10 {
 		interval = 300
+	}
+
+	if dryRun {
+		log.Println("⚠️  DRY RUN MODE ENABLED: No changes will be made to Tududi ⚠️")
 	}
 
 	ctx := context.Background()
@@ -93,18 +101,14 @@ func runSync(ctx context.Context, gh *github.Client) {
 	processedIDs := make(map[int64]bool)
 	var issuesToSync []*github.Issue
 
-	// 1. Fetch Issues (Removed 'state:open' so we get closed ones too)
-	// We sort by updated to ensure we catch status changes
+	// 1. Fetch Issues (Assigned to me)
 	opts := &github.SearchOptions{Sort: "updated", Order: "desc"}
-	
-	// Query: Assigned to me AND is an Issue (not PR)
 	query := fmt.Sprintf("assignee:%s is:issue", myLogin)
 	
 	result, _, err := gh.Search.Issues(ctx, query, opts)
 	if err != nil {
 		log.Printf("Error searching issues: %v", err)
 	} else {
-		// Limit to first 50 updated issues to save API quota on repeated runs
 		count := 0
 		for _, issue := range result.Issues {
 			if count >= 50 { break }
@@ -116,7 +120,7 @@ func runSync(ctx context.Context, gh *github.Client) {
 		}
 	}
 
-	// 2. Fetch Owned Repositories (Also fetching closed issues to sync state)
+	// 2. Fetch Issues from Owned Repositories
 	repoOpts := &github.RepositoryListOptions{
 		Type: "owner", 
 		ListOptions: github.ListOptions{PerPage: 100},
@@ -127,12 +131,11 @@ func runSync(ctx context.Context, gh *github.Client) {
 	} else {
 		for _, repo := range repos {
 			if repo.GetOwner().GetLogin() == myLogin {
-				// Fetch recent issues (open and closed)
 				issueOpts := &github.IssueListByRepoOptions{
-					State: "all", // Fetch open and closed
+					State: "all", 
 					Sort:  "updated",
 					Direction: "desc",
-					ListOptions: github.ListOptions{PerPage: 20}, // Get last 20 updated per repo
+					ListOptions: github.ListOptions{PerPage: 20},
 				}
 				repoIssues, _, err := gh.Issues.ListByRepo(ctx, myLogin, repo.GetName(), issueOpts)
 				if err != nil {
@@ -150,42 +153,47 @@ func runSync(ctx context.Context, gh *github.Client) {
 		}
 	}
 
-	log.Printf("Processing %d issues...", len(issuesToSync))
+	log.Printf("Processing %d GitHub issues...", len(issuesToSync))
 	syncIssuesToTududi(issuesToSync)
 }
 
 func syncIssuesToTududi(issues []*github.Issue) {
-	// Map Existing Tasks: UID -> Task Object
+	// --- FETCH DATA ---
 	existingTasks := fetchTududiTasks()
 	existingTaskMap := make(map[string]Task)
-	
 	for _, t := range existingTasks {
 		if t.UID != "" {
 			existingTaskMap[t.UID] = t
 		}
 	}
 
-	// Map Projects: Normalized Name -> ID
 	projects := fetchTududiProjects()
-	projectMap := make(map[string]int)
+	projectMap := make(map[string]int) // Normalized Name -> ID
 
+	// Debug Log to verify we are actually seeing the projects
+	var projectNames []string
 	for _, p := range projects {
-		projectMap[normalizeName(p.Name)] = p.ID
+		norm := normalizeName(p.Name)
+		projectMap[norm] = p.ID
+		projectNames = append(projectNames, fmt.Sprintf("%s(%d)", p.Name, p.ID))
 	}
+	log.Printf("Loaded %d existing projects from Tududi: %v", len(projects), projectNames)
 
+	// --- PROCESS ISSUES ---
 	for _, issue := range issues {
 		repo := issue.GetRepository()
 		
-		// Determine Repo Name and Details
+		// Determine Repo Details
 		var repoID int64
 		var repoName, repoDesc string
+		var isArchived bool
 		
 		if repo != nil {
 			repoID = repo.GetID()
 			repoName = repo.GetName()
-			repoDesc = repo.GetDescription()
+			repoDesc = repo.GetDescription() // Use actual description
+			isArchived = repo.GetArchived()
 		} else {
-			// Fallback parsing
 			if issue.RepositoryURL != nil {
 				parts := strings.Split(*issue.RepositoryURL, "/")
 				repoName = parts[len(parts)-1]
@@ -195,42 +203,53 @@ func syncIssuesToTududi(issues []*github.Issue) {
 		
 		tududiUID := fmt.Sprintf("gh_%d_%d", repoID, issue.GetNumber())
 		
-		// Determine target statuses
+		// Map Status (String for now, API seems to accept strings in Swagger)
 		targetStatus := "pending"
 		if issue.GetState() == "closed" {
 			targetStatus = "completed"
 		}
 
-		// --- CHECK 1: Does Task Exist? ---
+		// 1. UPDATE EXISTING TASK
 		if task, exists := existingTaskMap[tududiUID]; exists {
-			// Task exists. Check if we need to update status.
-			// Tududi Statuses: pending, completed, archived
-			// GitHub Statuses: open, closed
+			// Check for status drift
+			// Simple check: if GH is closed but Tududi is pending, or GH is open but Tududi is completed
+			ghIsClosed := (targetStatus == "completed")
 			
-			needsUpdate := false
-			
-			if targetStatus == "completed" && task.Status == "pending" {
-				needsUpdate = true
-			} else if targetStatus == "pending" && (task.Status == "completed" || task.Status == "archived") {
-				needsUpdate = true
-			}
+			// We handle status as interface{}, so convert to string for comparison
+			tududiStatus := fmt.Sprintf("%v", task.Status) 
+			tududiIsDone := (tududiStatus == "completed" || tududiStatus == "2" || tududiStatus == "archived")
 
-			if needsUpdate {
-				log.Printf("Updating Status for '%s': %s -> %s", task.Name, task.Status, targetStatus)
-				updateTaskStatus(task.ID, targetStatus)
+			if ghIsClosed && !tududiIsDone {
+				log.Printf("[UPDATE] Task '%s' marked completed in GitHub. Updating Tududi.", task.Name)
+				updateTaskStatus(task.ID, "completed")
+			} else if !ghIsClosed && tududiIsDone {
+				log.Printf("[UPDATE] Task '%s' re-opened in GitHub. Updating Tududi.", task.Name)
+				updateTaskStatus(task.ID, "pending")
 			}
-			continue // Skip to next issue
+			continue
 		}
 
-		// --- CHECK 2: Create New Task ---
+		// 2. CREATE NEW TASK
 		
-		// Find Project ID
+		// Resolve Project
 		normRepoName := normalizeName(repoName)
 		projID, exists := projectMap[normRepoName]
 		
 		if !exists {
-			log.Printf("Project '%s' not found locally. Creating...", repoName)
-			newID := createTududiProject(repoName, repoDesc)
+			// Determine Project Status based on Repo Archive state
+			projectStatus := "planned"
+			if isArchived {
+				projectStatus = "done" // or "cancelled"
+			}
+
+			if dryRun {
+				log.Printf("[DRY RUN] Would create project: '%s' (Status: %s, Desc: %s)", repoName, projectStatus, repoDesc)
+				// In dry run, we can't get an ID, so we skip task creation for this repo
+				continue
+			}
+
+			log.Printf("Project '%s' not found. Creating...", repoName)
+			newID := createTududiProject(repoName, repoDesc, projectStatus)
 			if newID != 0 {
 				projectMap[normRepoName] = newID
 				projID = newID
@@ -240,12 +259,12 @@ func syncIssuesToTududi(issues []*github.Issue) {
 			}
 		}
 
-		// Create the task
+		// Create Task
 		createTududiTask(issue, projID, tududiUID, repoName, targetStatus)
 	}
 }
 
-// --- Tududi API Helpers ---
+// --- HELPERS ---
 
 func getHeaders() map[string]string {
 	return map[string]string{
@@ -263,26 +282,25 @@ func normalizeName(name string) string {
 
 func fetchTududiProjects() []Project {
 	var projects []Project
-	// ADDED: ?status=all
-	// Without this, Tududi might hide 'done' or 'planned' projects, causing duplicates.
+	// Explicitly ask for ALL statuses
 	err := makeRequest("GET", "/projects?status=all", nil, &projects)
+	
 	if err != nil {
-		log.Printf("Warning: Failed to fetch projects: %v", err)
+		// If direct decode failed, it might be wrapped or the status type caused an unmarshal error earlier.
+		// Since we changed Status to interface{}, unmarshal should be safer now.
+		log.Printf("Error fetching projects: %v", err)
 	}
 	return projects
 }
 
 func fetchTududiTasks() []Task {
-	// Added filtering to get ALL tasks, including completed ones, so we don't recreate them
 	type TaskResponse struct {
 		Tasks []Task `json:"tasks"`
 	}
 	var resp TaskResponse
 	
-	// Fetch 'all' types (pending, completed, archived)
 	err := makeRequest("GET", "/tasks?type=all", nil, &resp)
 	if err != nil {
-		// Fallback for different API structures
 		var arrayResp []Task
 		if makeRequest("GET", "/tasks?type=all", nil, &arrayResp) == nil {
 			return arrayResp
@@ -291,28 +309,33 @@ func fetchTududiTasks() []Task {
 	return resp.Tasks
 }
 
-func createTududiProject(name, description string) int {
+func createTududiProject(name, description, status string) int {
 	if description == "" {
-		description = "Imported from GitHub"
+		description = fmt.Sprintf("Imported GitHub Repository: %s", name)
 	}
 	
 	payload := map[string]interface{}{
 		"name":        name,
-		"status":      "planned",
+		"status":      status, 
 		"description": description,
 		"priority":    "medium",
-		// "image_url": "...", // If you had a URL, you could add it here
 	}
 	var result Project
 	
 	err := makeRequest("POST", "/project", payload, &result)
 	if err != nil {
+		log.Printf("Failed to create project: %v", err)
 		return 0
 	}
 	return result.ID
 }
 
 func createTududiTask(issue *github.Issue, projectID int, uid string, repoName string, status string) {
+	if dryRun {
+		log.Printf("[DRY RUN] Would create Task: '%s' in ProjectID %d", issue.GetTitle(), projectID)
+		return
+	}
+
 	note := issue.GetBody()
 	note += fmt.Sprintf("\n\n**GitHub Source**: [Issue #%d](%s)", issue.GetNumber(), issue.GetHTMLURL())
 
@@ -333,7 +356,7 @@ func createTududiTask(issue *github.Issue, projectID int, uid string, repoName s
 		UID:       uid,
 		Name:      issue.GetTitle(),
 		Note:      note,
-		Status:    status, // Set initial status based on GH state
+		Status:    status,
 		Priority:  priority,
 		ProjectID: projectID,
 		Tags:      tags,
@@ -350,17 +373,16 @@ func createTududiTask(issue *github.Issue, projectID int, uid string, repoName s
 }
 
 func updateTaskStatus(taskID int, status string) {
-	// Using the specific toggle endpoint isn't ideal for setting exact state,
-	// so we use the PATCH endpoint to force specific fields.
+	if dryRun {
+		log.Printf("[DRY RUN] Would update Task %d status to %s", taskID, status)
+		return
+	}
+
 	payload := map[string]string{
 		"status": status,
 	}
-	
 	endpoint := fmt.Sprintf("/task/%d", taskID)
-	err := makeRequest("PATCH", endpoint, payload, nil)
-	if err != nil {
-		log.Printf("Failed to update task %d: %v", taskID, err)
-	}
+	makeRequest("PATCH", endpoint, payload, nil)
 }
 
 func makeRequest(method, endpoint string, body interface{}, target interface{}) error {
@@ -383,17 +405,15 @@ func makeRequest(method, endpoint string, body interface{}, target interface{}) 
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Request failed %s: %v", endpoint, err)
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		// Only log 404s if we are not expecting them (like checking for existence)
-		if resp.StatusCode != 404 || method != "GET" {
-			log.Printf("API Error (%d) on %s: %s", resp.StatusCode, endpoint, string(b))
-		}
+		// Only suppress 404s if strictly expecting them (logic handled in caller)
+		// But generally printing is safer for debug
+		log.Printf("API Error (%d) on %s: %s", resp.StatusCode, endpoint, string(b))
 		return fmt.Errorf("API Error %d", resp.StatusCode)
 	}
 
