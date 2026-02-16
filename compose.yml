@@ -1,6 +1,7 @@
 services:
   tududi-gh-sync:
     build: .
+    container_name: tududi-gh-sync
     environment:
       - GITHUB_TOKEN=your_github_pat_here
       # Use host.docker.internal for Mac/Windows, or network_mode: host for Linux
