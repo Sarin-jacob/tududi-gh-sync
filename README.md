@@ -1,123 +1,77 @@
 # Tududi GitHub Sync
 
-A lightweight, containerized Go service that keeps your **Tududi** task board in sync with your **GitHub** issues.
+A small Go service that keeps **Tududi** in step with your **GitHub** issues. One GitHub repository becomes one Tududi project, and one issue becomes one task.
 
-It automatically fetches issues assigned to you (or from repositories you own), creates the corresponding Projects in Tududi, and keeps the task status in sync (Open ↔ Pending, Closed ↔ Completed).
+## How it works
 
-## Features
+Each cycle (default every 5 minutes) it:
 
-* **Smart Sync:** Fetches issues assigned to you *and* issues from repositories you own.
-* **Auto-Project Creation:** Automatically creates a Project in Tududi for every GitHub Repository found (if it doesn't exist).
-* **Status Mapping:**
-* GitHub `Open` → Tududi `Pending` (Status 0)
-* GitHub `Closed` → Tududi `Completed` (Status 2)
+1. Reads the issues in repositories you own, and issues assigned to you in other repositories. It follows pagination, so no issue is missed. After the first cycle it only asks for issues changed since the last one, with a full pass every `FULL_SYNC_EVERY` cycles.
+2. Reads **all** projects, tasks and areas from Tududi.
+3. Matches each issue to a task by its **issue link**, which the sync writes into the task note (`**GitHub Source**: [Issue #12](https://github.com/...)`). A renamed issue updates its task and never creates a second one. A task is found whichever project it sits in.
+4. Creates what is missing and fills what is empty.
 
+### Safety rules
 
-* **Rich Metadata:** Populates tasks with the issue body, priority (based on labels like "urgent"), due dates (from milestones), and tags.
-* **Deduplication:** Uses strict Name + Project matching to prevent duplicate tasks.
-* **Archive Support:** If a GitHub repository is Archived, the Tududi Project is created with a "Done" status.
+- If Tududi's project, task or area list cannot be read, or looks truncated (it shrank to less than half of the previous cycle), the cycle stops before writing anything. It never works from a partial view.
+- A project is matched by repository name (case, `-` and `_` ignored). If several projects share a name, the oldest one (lowest id) is used.
+- It never deletes anything.
+- `DRY_RUN=true` logs every create and update without sending any of them.
 
-## Setup
+### What GitHub controls and what you control
 
-### Prerequisites
+| Field | Behaviour |
+|---|---|
+| Title, note (issue body + link) | GitHub is the source. Edit these on GitHub. |
+| Done / not started | GitHub is the source. A closed issue completes the task; a reopened issue reopens a completed task. |
+| In progress, waiting, cancelled, archived | Yours. The sync never changes them. |
+| Priority | Set from labels (`urgent`, `critical`, `high`, `blocker`, `p0`, `p1` → high; `low`, `minor`, `trivial`, `p3`, `p4` → low). With no priority label it is `medium` at creation and then left alone. |
+| Due date | From the milestone due date. Never cleared. |
+| Tags | The repository name, `github`, and the issue labels (`LABEL_TAGS=false` turns labels off). Tags are only added, never removed. |
+| Project area, description | Filled only if empty (see `AREA_MAP`). Never overwritten. |
+| Archived repository | Its project is marked done. |
 
-1. **GitHub Token:** A Personal Access Token (classic or fine-grained).
-* *Recommended Scope:* `repo` (for private) or just `public_repo`. If using Fine-grained, ensure `Issues: Read-only`.
-
-
-2. **Tududi API Key:** Your Bearer token or API Key from your Tududi instance.
-
-### Docker Compose (Recommended)
-
-Create a `docker-compose.yml` file:
-
-```yaml
-version: '3.8'
-
-services:
-  tududi-gh-sync:
-    build: .
-    container_name: tududi-gh-sync
-    restart: unless-stopped
-    environment:
-      - GITHUB_TOKEN=ghp_your_github_token_here
-      - TUDUDI_API_KEY=your_tududi_api_key_here
-      # If Tududi is on the same machine:
-      - TUDUDI_URL=http://host.docker.internal:3002/api/v1
-      # Check every 5 minutes (300 seconds)
-      - SYNC_INTERVAL=300
-      # Optional Debugging
-      - DRY_RUN=false
-      - DEBUG=false
-
-```
-
-Run it:
-
-```bash
-docker-compose up -d --build
-
-```
-
-### Manual Run (Go)
-
-```bash
-# 1. Export variables
-export GITHUB_TOKEN="ghp_..."
-export TUDUDI_API_KEY="ey..."
-export TUDUDI_URL="http://localhost:3002/api/v1"
-
-# 2. Run
-go run main.go
-
-```
+Because GitHub owns open/closed, close an issue on GitHub to finish the task. If you mark a task done in Tududi while its issue is still open, the next cycle reopens it.
 
 ## Configuration
 
 | Variable | Default | Description |
-| --- | --- | --- |
-| `GITHUB_TOKEN` | **Required** | Your GitHub Personal Access Token. |
-| `TUDUDI_API_KEY` | **Required** | Your Tududi Authentication Token. |
-| `TUDUDI_URL` | `http://localhost:3002/api/v1` | The base URL of your Tududi API. |
-| `SYNC_INTERVAL` | `300` | How often to check GitHub (in seconds). |
-| `DRY_RUN` | `false` | If `true`, logs what *would* happen without modifying data. |
-| `DEBUG` | `false` | If `true`, prints raw API responses and detailed logs. |
+|---|---|---|
+| `GITHUB_TOKEN` | required | Personal access token. Needs `repo` (private) or `public_repo`; fine-grained: Issues read-only and Metadata read-only. |
+| `TUDUDI_API_KEY` | required | Tududi API token. |
+| `TUDUDI_URL` | `http://localhost:3002/api/v1` | Base URL of the Tududi API. |
+| `SYNC_INTERVAL` | `300` | Seconds between cycles. |
+| `AREA_MAP` | empty | Area for each repo, as `repo=Area Name;other=Other Area`. The area must already exist in Tududi. |
+| `DEFAULT_AREA` | empty | Area for repos not in `AREA_MAP`. |
+| `EXCLUDE_REPOS` | empty | Comma-separated repo names to skip. |
+| `LABEL_TAGS` | `true` | Add issue labels as tags. |
+| `FULL_SYNC_EVERY` | `24` | Do a full pass every N cycles. |
+| `RUN_ONCE` | `false` | Run one cycle and exit. |
+| `DRY_RUN` | `false` | Log changes without writing them. |
+| `DEBUG` | `false` | Log every Tududi request. |
+| `GITHUB_API_URL` | empty | GitHub Enterprise or test server base URL. |
 
-## Building From Source
+## Run
 
-The project uses a multi-stage Dockerfile to ensure a tiny image size (Alpine Linux based).
+Docker Compose:
 
-**Dockerfile:**
-
-```dockerfile
-# Build Stage
-FROM golang:1.21-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY main.go .
-RUN go build -o sync-tool main.go
-
-# Run Stage
-FROM alpine:latest
-WORKDIR /app
-RUN apk --no-cache add ca-certificates
-COPY --from=builder /app/sync-tool .
-CMD ["./sync-tool"]
-
+```bash
+docker compose up -d --build
 ```
 
-## Deduplication Logic
+Manual:
 
-To avoid creating duplicate tasks:
+```bash
+export GITHUB_TOKEN=... TUDUDI_API_KEY=... TUDUDI_URL=https://tududi.example.com/api/v1
+DRY_RUN=true RUN_ONCE=true go run .   # look at the log first
+go run .
+```
 
-1. The sync tool creates a unique "fingerprint" for every task based on `Project ID` + `Normalized Task Name`.
-2. It checks if this fingerprint exists in Tududi before creating a new task.
-3. If it matches, it checks if the **Status** needs updating (e.g., you closed the issue on GitHub) and patches it using the Task UID.
+Test:
 
-## Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+```bash
+go test ./...
+```
 
 ## License
 
