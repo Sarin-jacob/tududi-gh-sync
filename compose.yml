@@ -1,7 +1,6 @@
 services:
   tududi-gh-sync:
     build: .
-    
     container_name: tududi-gh-sync
     environment:
       - GITHUB_TOKEN=your_github_pat_here
@@ -9,4 +8,9 @@ services:
       - TUDUDI_URL=http://host.docker.internal:3002/api/v1
       - TUDUDI_API_KEY=your_tududi_bearer_token
       - SYNC_INTERVAL=300
+      # Optional: area per repo (areas must exist in Tududi) and a fallback area
+      # - AREA_MAP=Billy=Affybo;TrackView=Company/Work
+      # - DEFAULT_AREA=Hobby
+      # Set to true for a first look: logs changes without writing them
+      - DRY_RUN=false
     restart: unless-stopped
